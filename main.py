@@ -11,6 +11,9 @@ import requests
 from io import BytesIO
 import chardet
 
+# Константа для fallback на Playwright при малом размере контента
+PLAYWRIGHT_MIN_CONTENT_SIZE = 1024  # 1 KB - если контента меньше, пробуем Playwright
+
 # Инициализация FastAPI приложения
 app = FastAPI(
     title="URL to Markdown API",
@@ -78,6 +81,41 @@ async def convert_url(url: str, request: Request):
             # Асинхронная функция конвертации
             async def _convert() -> str:
                 # Блокировка для потокового выполнения (для синхронных операций requests)
+                
+                def _run_playwright(url: str) -> str | None:
+                    """Выполняет конвертацию через Playwright для динамических сайтов"""
+                    try:
+                        import playwright
+                        from playwright.sync_api import sync_playwright
+                    except ImportError:
+                        logger.warning("Playwright not installed, skipping fallback")
+                        return None
+                    
+                    try:
+                        with sync_playwright() as p:
+                            browser = p.chromium.launch(headless=True)
+                            page = browser.new_page()
+                            page.goto(url, timeout=REQUEST_TIMEOUT * 1000)
+                            page.wait_for_load_state('networkidle')
+                            html = page.content()
+                            browser.close()
+                        
+                        # Конвертируем полученный HTML через MarkItDown
+                        instance = MarkItDown()
+                        temp_file = None
+                        try:
+                            with tempfile.NamedTemporaryFile(mode='w', suffix='.html', delete=False, encoding='utf-8') as f:
+                                f.write(html)
+                                temp_file = f.name
+                            conversion_result = instance.convert_local(temp_file)
+                            return conversion_result.text_content
+                        finally:
+                            if temp_file and os.path.exists(temp_file):
+                                os.unlink(temp_file)
+                    except Exception as e:
+                        logger.error("Playwright conversion failed: %s", str(e))
+                        return None
+                
                 def _run():
                     # Валидация URL: проверка наличия домена
                     parsed = urlparse(decoded_url)
@@ -105,46 +143,41 @@ async def convert_url(url: str, request: Request):
                     
                     logger.info("Downloaded %d bytes, content-type: %s", len(content), response.headers.get('content-type', 'unknown'))
                     
+                    # Определяем тип контента
+                    content_type = response.headers.get('content-type', '')
+                    
+                    # Логируем первые 200 символов контента для отладки
+                    if len(content) > 0:
+                        preview = content[:min(200, len(content))].decode('utf-8', errors='replace')
+                        logger.info("Content preview: %s", preview)
+                    
                     # Инициализация конвертера MarkItDown
                     instance = MarkItDown()
                     
-                    # Определяем тип контента и выбираем метод конвертации
-                    content_type = response.headers.get('content-type', '')
                     if 'text/html' in content_type:
-                        # Для HTML создаем временный файл
-                        temp_file = None
-                        try:
-                            # Определяем кодировку из заголовков или с помощью chardet
-                            encoding = 'utf-8'
-                            if 'charset=' in content_type:
-                                encoding = content_type.split('charset=')[-1].strip()
-                            else:
-                                # Пытаемся определить кодировку автоматически
-                                try:
-                                    detected = chardet.detect(content)
-                                    encoding = detected.get('encoding', 'utf-8')
-                                except Exception:
-                                    pass
-                            
-                            logger.info("Using encoding: %s for HTML content", encoding)
-                            
-                            with tempfile.NamedTemporaryFile(mode='w', suffix='.html', delete=False, encoding=encoding, errors='replace') as f:
-                                f.write(content.decode(encoding, errors='replace'))
-                                temp_file = f.name
-                            
-                            logger.info("Converting HTML from temp file: %s", temp_file)
-                            conversion_result = instance.convert_local(temp_file)
-                        finally:
-                            if temp_file and os.path.exists(temp_file):
-                                os.unlink(temp_file)
-                                logger.debug("Cleaned up temp file: %s", temp_file)
+                        # Для HTML передаем байты напрямую MarkItDown
+                        # MarkItDown сам определит кодировку из HTML
+                        logger.info("Converting HTML from bytes directly")
+                        conversion_result = instance.convert_stream(BytesIO(content))
                     else:
                         # Для других типов используем потоковое чтение
                         logger.info("Converting from stream (content-type: %s)", content_type)
                         conversion_result = instance.convert_stream(BytesIO(content))
                     
+                    markdown_content = conversion_result.text_content
+                    logger.info("Markdown content size: %d bytes", len(markdown_content))
+                    
+                    # Если markdown слишком маленький, пробуем Playwright как fallback
+                    if len(markdown_content) < PLAYWRIGHT_MIN_CONTENT_SIZE and 'text/html' in content_type:
+                        logger.info("Markdown size (%d bytes) is below threshold (%d bytes), attempting Playwright fallback", len(markdown_content), PLAYWRIGHT_MIN_CONTENT_SIZE)
+                        playwright_result = _run_playwright(decoded_url)
+                        if playwright_result:
+                            logger.info("Playwright fallback successful")
+                            return playwright_result
+                        logger.warning("Playwright fallback failed")
+                    
                     logger.info("Conversion completed successfully")
-                    return conversion_result.text_content
+                    return markdown_content
 
                 # Выполняем синхронную функцию в отдельном потоке
                 return await asyncio.to_thread(_run)

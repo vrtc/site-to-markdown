@@ -4,3 +4,4 @@ markitdown[all]
 pydantic
 requests
 chardet
+playwright
