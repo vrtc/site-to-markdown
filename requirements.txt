@@ -3,3 +3,4 @@ uvicorn
 markitdown[all]
 pydantic
 requests
+chardet

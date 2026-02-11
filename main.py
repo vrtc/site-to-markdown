@@ -9,6 +9,7 @@ import os
 import tempfile
 import requests
 from io import BytesIO
+import chardet
 
 # Инициализация FastAPI приложения
 app = FastAPI(
@@ -113,8 +114,22 @@ async def convert_url(url: str, request: Request):
                         # Для HTML создаем временный файл
                         temp_file = None
                         try:
-                            with tempfile.NamedTemporaryFile(mode='w', suffix='.html', delete=False, encoding='utf-8') as f:
-                                f.write(content.decode('utf-8'))
+                            # Определяем кодировку из заголовков или с помощью chardet
+                            encoding = 'utf-8'
+                            if 'charset=' in content_type:
+                                encoding = content_type.split('charset=')[-1].strip()
+                            else:
+                                # Пытаемся определить кодировку автоматически
+                                try:
+                                    detected = chardet.detect(content)
+                                    encoding = detected.get('encoding', 'utf-8')
+                                except Exception:
+                                    pass
+                            
+                            logger.info("Using encoding: %s for HTML content", encoding)
+                            
+                            with tempfile.NamedTemporaryFile(mode='w', suffix='.html', delete=False, encoding=encoding, errors='replace') as f:
+                                f.write(content.decode(encoding, errors='replace'))
                                 temp_file = f.name
                             
                             logger.info("Converting HTML from temp file: %s", temp_file)
